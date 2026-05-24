@@ -1,0 +1,9 @@
+[
+  {
+    "username": "azril",
+    "password": "admin123",
+    "role": "owner",
+    "expiredDate": "2299-12-31",
+    "lastSend": 0
+  }
+]

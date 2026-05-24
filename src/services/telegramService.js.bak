@@ -1,0 +1,536 @@
+process.on("uncaughtException", console.error);
+process.on("unhandledRejection", console.error);
+
+const fs = require('fs');
+const path = require('path');
+const TelegramBot = require("node-telegram-bot-api");
+const { logger } = require('../utils/logger');
+const { loadDatabase, saveDatabase } = require('./databaseService');
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args)).catch(() => null);
+
+const TOKEN   = process.env.TELEGRAM_TOKEN || "8671540051:AAEaEoE_6oFAQ0EA1_j9cXqOWEZzM76J1cQ";
+const OWNER_ID = parseInt(process.env.OWNER_ID || "5914076434");
+const idowner  = [OWNER_ID];
+
+const VALID_ROLES = ['member','reseller','reseller1','vip','owner','high owner','admin','high admin','dev'];
+
+const PENDING_FILE  = path.join(__dirname, "data/pending.json");
+const CHAT_FILE     = path.join(__dirname, "data/chat_sessions.json");
+
+function ensureFiles() {
+  [PENDING_FILE, CHAT_FILE].forEach(f => {
+    if (!fs.existsSync(path.dirname(f))) fs.mkdirSync(path.dirname(f), { recursive: true });
+    if (!fs.existsSync(f)) fs.writeFileSync(f, '[]');
+  });
+}
+ensureFiles();
+
+function loadPending() { try { return JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8')); } catch { return []; } }
+function savePending(d) { fs.writeFileSync(PENDING_FILE, JSON.stringify(d, null, 2)); }
+function loadChats()   { try { return JSON.parse(fs.readFileSync(CHAT_FILE, 'utf8')); } catch { return []; } }
+function saveChats(d)  { fs.writeFileSync(CHAT_FILE, JSON.stringify(d, null, 2)); }
+
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// ── HELPER ───────────────────────────────────
+function isOwner(id) { return idowner.includes(id); }
+
+function mainMenu(name, owner) {
+  const inline = [
+    [{ text: "🛒 Beli Akun", callback_data: "buy_account" },
+     { text: "📋 Status Akun", callback_data: "cek_akun" }],
+    [{ text: "💬 Chat Owner", callback_data: "open_chat" }],
+  ];
+  if (owner) {
+    inline.push([
+      { text: "👥 List User",       callback_data: "list_user" },
+      { text: "🎛 Buat Custom",     callback_data: "create_custom" }
+    ]);
+    inline.push([
+      { text: "🗑 Hapus User",      callback_data: "delete_user" },
+      { text: "⏳ Set Expired",     callback_data: "set_expire" }
+    ]);
+    inline.push([
+      { text: "📥 Pending Orders",  callback_data: "pending_list" },
+      { text: "💬 Inbox Chat",      callback_data: "inbox_chat" }
+    ]);
+    inline.push([{ text: "📊 Stats Server", callback_data: "server_stats" }]);
+  }
+  return {
+    caption:
+`🐉 *AZRIL STRAVAS API*
+━━━━━━━━━━━━━━━━━━
+👋 Halo *${name}*!
+${owner ? '👑 Mode: *OWNER*' : '👤 Mode: *User*'}
+
+Pilih menu di bawah:`,
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: inline }
+  };
+}
+
+// ── /start ───────────────────────────────────
+bot.onText(/^\/?(?:start|menu)$/i, async (msg) => {
+  const id    = msg.chat.id;
+  const name  = msg.from.first_name || 'User';
+  const owner = isOwner(msg.from.id);
+  const opts  = mainMenu(name, owner);
+
+  const LOGO = path.join(__dirname, '../../logo.jpg');
+  if (fs.existsSync(LOGO)) {
+    bot.sendPhoto(id, LOGO, opts).catch(() => bot.sendMessage(id, opts.caption, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }));
+  } else {
+    bot.sendMessage(id, opts.caption, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup });
+  }
+});
+
+// ── CALLBACK ─────────────────────────────────
+bot.on("callback_query", async (query) => {
+  const id     = query.from.id;
+  const chatId = query.message.chat.id;
+  const data   = query.data;
+  const owner  = isOwner(id);
+  bot.answerCallbackQuery(query.id);
+
+  // ── ACC / REJECT order dari APK ──
+  if (data.startsWith("acc_")) {
+    const username = data.replace("acc_", "");
+    return _accUser(chatId, username, query);
+  }
+  if (data.startsWith("rej_")) {
+    const username = data.replace("rej_", "");
+    return _rejectUser(chatId, username, query);
+  }
+
+  switch (data) {
+    case "buy_account":
+      bot.sendMessage(chatId,
+`💰 *CARA BELI AKUN AZRIL STRAVAS*
+━━━━━━━━━━━━━━━━━━
+Kirim perintah:
+\`/beli username|password|hari|role\`
+
+*Contoh:*
+\`/beli user123|pass123|30|member\`
+
+*HARGA:*
+• Member    — Rp 5.000/bln  | Rp 10.000 perm
+• Reseller  — Rp 10.000/bln | Rp 20.000 perm
+• VIP       — Rp 20.000/bln | Rp 35.000 perm
+• Owner     — Rp 40.000/bln | Rp 80.000 perm
+
+*PAYMENT:*
+DANA: 085275080962 (Azahar Apriansyah)
+
+Setelah TF, kirim foto bukti ke bot ini.`,
+        { parse_mode: "Markdown" });
+      break;
+
+    case "cek_akun": {
+      const db   = loadDatabase();
+      const user = db.find(u => String(u.telegramId) === String(id));
+      if (!user) {
+        bot.sendMessage(chatId, "❌ Akun tidak ditemukan.\nCatatan: akun dibuat via bot, bukan via APK.");
+        return;
+      }
+      const exp   = new Date(user.expiredDate);
+      const sisa  = Math.ceil((exp - new Date()) / 86400000);
+      bot.sendMessage(chatId,
+`📋 *Info Akun*
+👤 Username: \`${user.username}\`
+🎖 Role: ${user.role}
+⏳ Expired: ${user.expiredDate}
+📅 Sisa: ${sisa > 0 ? sisa + ' hari' : '❌ EXPIRED'}`,
+        { parse_mode: "Markdown" });
+      break;
+    }
+
+    case "open_chat":
+      bot.sendMessage(chatId,
+`💬 *Chat dengan Owner*
+━━━━━━━━━━━━━━━━━━
+Kirim pesan kamu:
+\`/tanya pesan kamu di sini\`
+
+Contoh:
+\`/tanya Halo min, mau tanya soal paket VIP\`
+
+Owner akan membalas secepatnya.`,
+        { parse_mode: "Markdown" });
+      break;
+
+    case "list_user":
+      if (!owner) return;
+      const db2 = loadDatabase();
+      if (!db2.length) { bot.sendMessage(chatId, "📋 Database kosong."); return; }
+      const list = db2.map((u,i) => `${i+1}. *${u.username}* | ${u.role} | ${u.expiredDate}`).join('\n');
+      bot.sendMessage(chatId, `📋 *${db2.length} User:*\n\n${list}`, { parse_mode: "Markdown" });
+      break;
+
+    case "create_custom":
+      if (!owner) return;
+      bot.sendMessage(chatId, "🎛 Format:\n`/ckey username,password,hari,role`", { parse_mode: "Markdown" });
+      break;
+
+    case "delete_user":
+      if (!owner) return;
+      bot.sendMessage(chatId, "🗑 `/hapus username`", { parse_mode: "Markdown" });
+      break;
+
+    case "set_expire":
+      if (!owner) return;
+      bot.sendMessage(chatId, "⏳ `/addexp username|hari`", { parse_mode: "Markdown" });
+      break;
+
+    case "pending_list":
+      if (!owner) return;
+      const pend = loadPending();
+      if (!pend.length) { bot.sendMessage(chatId, "📥 Tidak ada order pending."); return; }
+      const plist = pend.map((p,i) =>
+        `${i+1}. *${p.username}* | ${p.role} | ${p.day}hr\nACC: \`/acc ${p.username}\` | REJECT: \`/reject ${p.username}\``
+      ).join('\n\n');
+      bot.sendMessage(chatId, `📥 *Pending Orders (${pend.length}):*\n\n${plist}`, { parse_mode: "Markdown" });
+      break;
+
+    case "inbox_chat":
+      if (!owner) return;
+      const chats = loadChats();
+      const fromUsers = [...new Set(chats.filter(c => c.from === 'user').map(c => c.username))];
+      if (!fromUsers.length) { bot.sendMessage(chatId, "💬 Inbox kosong."); return; }
+      const unreadInfo = fromUsers.map(u => {
+        const last = chats.filter(c => c.username === u).pop();
+        const unread = chats.filter(c => c.username === u && c.from === 'user' && !c.read).length;
+        return `👤 *${u}* ${unread > 0 ? `(${unread} baru)` : ''}\nBalas: \`/reply ${u}|pesan\`\nPesan terakhir: ${last?.message?.substring(0,40) || '-'}`;
+      }).join('\n\n');
+      bot.sendMessage(chatId, `💬 *Inbox Chat:*\n\n${unreadInfo}`, { parse_mode: "Markdown" });
+      break;
+
+    case "server_stats":
+      if (!owner) return;
+      const db3   = loadDatabase();
+      const aktif = db3.filter(u => new Date(u.expiredDate) > new Date()).length;
+      const pend2 = loadPending();
+      bot.sendMessage(chatId,
+`📊 *Stats Azril Stravas*
+━━━━━━━━━━━━━━━━━━
+👥 Total User: ${db3.length}
+✅ Aktif: ${aktif}
+❌ Expired: ${db3.length - aktif}
+📥 Pending Order: ${pend2.length}
+🤖 Bot: RUNNING
+🌐 API: king.daiyat19.my.id:3174`,
+        { parse_mode: "Markdown" });
+      break;
+  }
+});
+
+// ── /beli ────────────────────────────────────
+bot.onText(/^\/beli (.+)/i, async (msg, match) => {
+  const chatId    = msg.chat.id;
+  const userId    = msg.from.id;
+  const requester = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+  const parts     = match[1].split('|').map(s => s.trim());
+  if (parts.length < 3) return bot.sendMessage(chatId, "❌ Format: `/beli username|password|hari|role`", { parse_mode: "Markdown" });
+
+  let [username, password, day, role] = parts;
+  role = (role || 'member').toLowerCase();
+  if (!VALID_ROLES.includes(role)) return bot.sendMessage(chatId, "❌ Role tidak valid.");
+  if (isNaN(parseInt(day)))        return bot.sendMessage(chatId, "❌ Durasi harus angka.");
+
+  const db = loadDatabase();
+  if (db.find(u => u.username === username)) return bot.sendMessage(chatId, "❌ Username sudah ada!");
+
+  const pend = loadPending();
+  if (pend.find(p => p.fromUser === userId)) return bot.sendMessage(chatId, "⏳ Masih ada request pending.");
+
+  const reqId = Date.now();
+  pend.push({ reqId, fromUser: userId, fromName: requester, username, password, role, day: parseInt(day), step: "wait_proof" });
+  savePending(pend);
+
+  bot.sendMessage(chatId,
+`✅ *Request diterima!*
+👤 Username: \`${username}\`
+🎖 Role: ${role} | ⏳ ${day} hari
+
+📸 Kirim *foto bukti transfer* sekarang.`,
+    { parse_mode: "Markdown" });
+});
+
+// ── Handle foto bukti TF (via Telegram) ──────
+bot.on("photo", (msg) => {
+  const userId = msg.from.id;
+  const pend   = loadPending();
+  const req    = pend.find(p => p.fromUser === userId && p.step === "wait_proof");
+  if (!req) return;
+
+  const photoId = msg.photo[msg.photo.length - 1].file_id;
+  req.proof = photoId;
+  req.step  = "pending_acc";
+  savePending(pend);
+
+  idowner.forEach(ownerId => {
+    bot.sendPhoto(ownerId, photoId, {
+      caption:
+`📥 *ORDER BARU (via Telegram)*
+━━━━━━━━━━━━━━━━━━
+👤 Dari: ${req.fromName}
+👤 Username: \`${req.username}\`
+🔐 Password: \`${req.password}\`
+🎖 Role: ${req.role} | ⏳ ${req.day} hari`,
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[
+        { text: "✅ ACC",    callback_data: `acc_${req.username}` },
+        { text: "❌ REJECT", callback_data: `rej_${req.username}` },
+        { text: "👤 User",   url: `tg://user?id=${req.fromUser}` }
+      ]]}
+    }).catch(e => logger.error("Kirim owner gagal: " + e.message));
+  });
+
+  bot.sendMessage(userId, "⏳ Bukti diterima! Menunggu konfirmasi owner.");
+});
+
+// ── /tanya — user tanya ke owner ─────────────
+bot.onText(/^\/tanya (.+)/i, (msg, match) => {
+  const chatId   = msg.chat.id;
+  const username = msg.from.username || String(msg.from.id);
+  const message  = match[1].trim();
+
+  const chat = {
+    id: Date.now(), username, message, from: 'user',
+    telegramId: msg.from.id,
+    time: new Date().toISOString(), read: false
+  };
+  const chats = loadChats();
+  chats.push(chat);
+  saveChats(chats);
+
+  idowner.forEach(ownerId => {
+    bot.sendMessage(ownerId,
+`💬 *Pesan dari User*
+━━━━━━━━━━━━━━━━━━
+👤 User: *${username}* (ID: ${msg.from.id})
+📝 Pesan: ${message}
+━━━━━━━━━━━━━━━━━━
+Balas: \`/reply ${username}|pesan kamu\``,
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  bot.sendMessage(chatId, "✅ Pesan terkirim ke owner! Tunggu balasan ya.");
+});
+
+// ── /reply — owner balas ke user ─────────────
+bot.onText(/^\/reply (.+)/i, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isOwner(msg.from.id)) return bot.sendMessage(chatId, "❌ Bukan owner.");
+
+  const parts = match[1].split('|');
+  if (parts.length < 2) return bot.sendMessage(chatId, "❌ Format: `/reply username|pesan`", { parse_mode: "Markdown" });
+
+  const username = parts[0].trim();
+  const message  = parts.slice(1).join('|').trim();
+
+  // Simpan ke chat history
+  const chats = loadChats();
+  const reply = {
+    id: Date.now(), username, message, from: 'owner',
+    time: new Date().toISOString(), read: false
+  };
+  chats.push(reply);
+  saveChats(chats);
+
+  // Cari telegramId user
+  const userChat = [...chats].reverse().find(c => c.username === username && c.from === 'user' && c.telegramId);
+  if (userChat?.telegramId) {
+    bot.sendMessage(userChat.telegramId,
+`💬 *Pesan dari Owner Azril Stravas*
+━━━━━━━━━━━━━━━━━━
+${message}`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  }
+
+  bot.sendMessage(chatId, `✅ Balasan terkirim ke *${username}*.`, { parse_mode: "Markdown" });
+});
+
+// ── /ckey — owner buat akun langsung ─────────
+bot.onText(/^\/ckey (.+)/i, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isOwner(msg.from.id)) return bot.sendMessage(chatId, "❌ Bukan owner.");
+  const parts = match[1].split(',').map(s => s.trim());
+  if (parts.length < 3) return bot.sendMessage(chatId, "❌ Format: `/ckey username,pass,hari,role`", { parse_mode: "Markdown" });
+
+  let [username, password, day, role] = parts;
+  role = (role || 'member').toLowerCase();
+  if (!VALID_ROLES.includes(role)) return bot.sendMessage(chatId, "❌ Role tidak valid.");
+
+  const db = loadDatabase();
+  if (db.find(u => u.username === username)) return bot.sendMessage(chatId, "❌ Username sudah ada!");
+
+  const exp = new Date();
+  exp.setDate(exp.getDate() + parseInt(day));
+  db.push({ username, password, role, expiredDate: exp.toISOString().split("T")[0], lastSend: 0 });
+  saveDatabase(db);
+
+  bot.sendMessage(chatId,
+`✅ *Akun dibuat!*
+👤 Username: \`${username}\`
+🔐 Password: \`${password}\`
+🎖 Role: ${role}
+⏳ Expired: ${exp.toISOString().split("T")[0]}`,
+    { parse_mode: "Markdown" });
+});
+
+// ── /acc ──────────────────────────────────────
+bot.onText(/^\/acc (.+)/i, (msg, match) => {
+  if (!isOwner(msg.from.id)) return;
+  _accUser(msg.chat.id, match[1].trim(), null);
+});
+
+function _accUser(chatId, username, query) {
+  const pend = loadPending();
+  const db   = loadDatabase();
+  const req  = pend.find(p => p.username === username);
+
+  if (!req) return bot.sendMessage(chatId, "❌ Request tidak ditemukan.");
+  if (db.find(u => u.username === username)) return bot.sendMessage(chatId, "❌ Username sudah ada.");
+
+  const exp = new Date();
+  exp.setDate(exp.getDate() + req.day);
+  db.push({ username: req.username, password: req.password, role: req.role,
+    expiredDate: exp.toISOString().split("T")[0], lastSend: 0 });
+  saveDatabase(db);
+  savePending(pend.filter(p => p.username !== username));
+
+  bot.sendMessage(chatId, `✅ *${username}* di-ACC!`, { parse_mode: "Markdown" });
+
+  if (req.fromUser) {
+    bot.sendMessage(req.fromUser,
+`✅ *AKUN AKTIF!*
+━━━━━━━━━━━━━━━━━━
+👤 Username: \`${req.username}\`
+🔐 Password: \`${req.password}\`
+🎖 Role: ${req.role}
+⏳ Expired: ${exp.toISOString().split("T")[0]}
+━━━━━━━━━━━━━━━━━━
+Login di app *Azril Stravas* sekarang ✅`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  }
+
+  if (query) bot.answerCallbackQuery(query.id, { text: "✅ ACC berhasil!" }).catch(() => {});
+}
+
+// ── /reject ───────────────────────────────────
+bot.onText(/^\/reject (.+)/i, (msg, match) => {
+  if (!isOwner(msg.from.id)) return;
+  _rejectUser(msg.chat.id, match[1].trim(), null);
+});
+
+function _rejectUser(chatId, username, query) {
+  const pend = loadPending();
+  const req  = pend.find(p => p.username === username);
+  if (!req) return bot.sendMessage(chatId, "❌ Request tidak ditemukan.");
+
+  savePending(pend.filter(p => p.username !== username));
+  bot.sendMessage(chatId, `❌ Request *${username}* ditolak.`, { parse_mode: "Markdown" });
+
+  if (req.fromUser) {
+    bot.sendMessage(req.fromUser, "❌ Request akun kamu *ditolak*.\nHubungi @usserunknownn untuk info.", { parse_mode: "Markdown" }).catch(() => {});
+  }
+  if (query) bot.answerCallbackQuery(query.id, { text: "❌ Rejected." }).catch(() => {});
+}
+
+// ── /hapus ────────────────────────────────────
+bot.onText(/^\/hapus (.+)/i, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isOwner(msg.from.id)) return;
+  const db  = loadDatabase();
+  const idx = db.findIndex(u => u.username === match[1].trim());
+  if (idx === -1) return bot.sendMessage(chatId, "❌ User tidak ditemukan.");
+  db.splice(idx, 1);
+  saveDatabase(db);
+  bot.sendMessage(chatId, `🗑 *${match[1].trim()}* dihapus.`, { parse_mode: "Markdown" });
+});
+
+// ── /addexp ───────────────────────────────────
+bot.onText(/^\/addexp (.+)/i, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isOwner(msg.from.id)) return;
+  const [username, days] = match[1].split('|').map(s => s.trim());
+  const db   = loadDatabase();
+  const user = db.find(u => u.username === username);
+  if (!user) return bot.sendMessage(chatId, "❌ User tidak ditemukan.");
+  const d = new Date(isNaN(new Date(user.expiredDate)) ? Date.now() : user.expiredDate);
+  d.setDate(d.getDate() + parseInt(days));
+  user.expiredDate = d.toISOString().split("T")[0];
+  saveDatabase(db);
+  bot.sendMessage(chatId, `✅ Expired *${username}* → *${user.expiredDate}*`, { parse_mode: "Markdown" });
+});
+
+// ── /setrole ──────────────────────────────────
+bot.onText(/^\/setrole (.+)/i, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isOwner(msg.from.id)) return;
+  const [username, newRole] = match[1].split('|').map(s => s.trim());
+  if (!VALID_ROLES.includes(newRole?.toLowerCase())) return bot.sendMessage(chatId, "❌ Role tidak valid.");
+  const db   = loadDatabase();
+  const user = db.find(u => u.username === username);
+  if (!user) return bot.sendMessage(chatId, "❌ User tidak ditemukan.");
+  user.role = newRole.toLowerCase();
+  saveDatabase(db);
+  bot.sendMessage(chatId, `✅ Role *${username}* → *${newRole}*`, { parse_mode: "Markdown" });
+});
+
+// ── /list ─────────────────────────────────────
+bot.onText(/^\/list$/i, (msg) => {
+  if (!isOwner(msg.from.id)) return;
+  const db = loadDatabase();
+  if (!db.length) return bot.sendMessage(msg.chat.id, "📋 Database kosong.");
+  const text = db.map((u,i) => `${i+1}. *${u.username}* | ${u.role} | ${u.expiredDate}`).join('\n');
+  bot.sendMessage(msg.chat.id, `📋 *${db.length} User:*\n\n${text}`, { parse_mode: "Markdown" });
+});
+
+// ── /help ─────────────────────────────────────
+bot.onText(/^\/help$/i, (msg) => {
+  const owner = isOwner(msg.from.id);
+  bot.sendMessage(msg.chat.id,
+`📚 *Perintah Bot Azril Stravas*
+
+*User:*
+/start — Menu utama
+/beli user|pass|hari|role — Request beli
+/tanya pesan — Tanya ke owner
+/help — Bantuan
+
+${owner ? `*Owner:*
+/ckey user,pass,hari,role — Buat akun
+/hapus user — Hapus user
+/addexp user|hari — Tambah expired
+/setrole user|role — Ubah role
+/list — List semua user
+/acc user — ACC request
+/reject user — Tolak request
+/reply user|pesan — Balas chat user` : ''}`,
+    { parse_mode: "Markdown" });
+});
+
+// ── Error handler ─────────────────────────────
+bot.on("polling_error", err => logger.error("[BOT] " + err.message));
+
+// ── Start ─────────────────────────────────────
+function startTelegramBot() {
+  logger.info(`Telegram bot started (owner: ${OWNER_ID})`);
+  const LOGO = path.join(__dirname, '../../logo.jpg');
+  const notif = `🟢 *Azril Stravas API ONLINE*\n\n🕐 ${new Date().toLocaleString('id-ID', {timeZone:'Asia/Jakarta'})} WIB\n🤖 Bot siap terima order & chat`;
+
+  if (fs.existsSync(LOGO)) {
+    bot.sendPhoto(OWNER_ID, LOGO, { caption: notif, parse_mode: "Markdown" }).catch(() => {
+      bot.sendMessage(OWNER_ID, notif, { parse_mode: "Markdown" }).catch(() => {});
+    });
+  } else {
+    bot.sendMessage(OWNER_ID, notif, { parse_mode: "Markdown" }).catch(() => {});
+  }
+}
+
+module.exports = { bot, startTelegramBot };
